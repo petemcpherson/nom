@@ -30,7 +30,11 @@ const mouse = { x: W / 2, y: H / 2 };
 function setPointer(e) { mouse.x = e.clientX; mouse.y = e.clientY; }
 addEventListener('pointermove', setPointer);
 addEventListener('pointerdown', e => { setPointer(e); onTap(); });
-addEventListener('keydown', e => { if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); onTap(); } });
+addEventListener('keydown', e => {
+  if (mode === 'pick') { if (/^Digit[1-3]$/.test(e.code)) choose(+e.code[5] - 1); }
+  else if (e.code === 'KeyP' || e.code === 'Escape') { if (mode === 'play') paused = !paused; }
+  else if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); onTap(); }
+});
 
 // ---------- audio ----------
 let ac;
@@ -74,18 +78,67 @@ const rand = (a, b) => a + Math.random() * (b - a);
 let best = 0;
 try { best = +localStorage.getItem('nom-best2') || 0; } catch (_) {}
 
-let mode = 'title'; // title | play | dead
+// ---------- upgrades & bosses ----------
+// each pick is a small nudge; picks stack with no cap, so a run builds toward
+// whatever the player keeps choosing. `now(u)` shows the running total on the card.
+const BASE_UP = {
+  dashCd: 1.4, charges: 1, chargeBits: 0, shrink: 0.016, growth: 0.54, hurtLoss: 0.22, gold: 0.03,
+  powerDur: 6, magnet: 0, comboTime: 1.2, bossDmg: 1, speed: 290, lives: 0, lifeBits: 0,
+};
+const pct = (v, base) => `${v >= base ? '+' : '-'}${Math.round(Math.abs(v / base - 1) * 100)}%`;
+const UPGRADES = [
+  { id: 'dash', name: 'Quick Dash', desc: 'Dash recharges 5% faster', apply: u => u.dashCd *= 0.95,
+    now: u => `cooldown ${pct(u.dashCd, BASE_UP.dashCd)}` },
+  { id: 'charges', name: 'Dash Cell', desc: 'Every 3rd cell adds a dash charge',
+    apply: u => { if (++u.chargeBits % 3 === 0) u.charges++; },
+    now: u => `${u.charges} charge${u.charges > 1 ? 's' : ''} · cell ${u.chargeBits % 3}/3` },
+  { id: 'burn', name: 'Slow Burn', desc: 'Shrink 6% slower', apply: u => u.shrink *= 0.94,
+    now: u => `shrink ${pct(u.shrink, BASE_UP.shrink)}` },
+  { id: 'bite', name: 'Big Bite', desc: 'Grow 4% more per bite', apply: u => u.growth *= 1.04,
+    now: u => `growth ${pct(u.growth, BASE_UP.growth)}` },
+  { id: 'skin', name: 'Thick Skin', desc: 'Spikes, bosses & boss shots shrink you 7% less', apply: u => u.hurtLoss *= 0.93,
+    now: u => `shrink per hit ${pct(u.hurtLoss, BASE_UP.hurtLoss)}` },
+  { id: 'lucky', name: 'Lucky', desc: 'Gold blobs 15% more common', apply: u => u.gold *= 1.15,
+    now: u => `gold ${pct(u.gold, BASE_UP.gold)}` },
+  { id: 'power', name: 'Overcharge', desc: 'Powers last 8% longer', apply: u => u.powerDur *= 1.08,
+    now: u => `duration ${pct(u.powerDur, BASE_UP.powerDur)}` },
+  { id: 'magnet', name: 'Gravity', desc: 'Food drifts to you; reach grows', apply: u => u.magnet++,
+    now: u => u.magnet ? `reach ${(2.2 + u.magnet * 0.8).toFixed(1)}x size` : 'no pull yet' },
+  { id: 'combo', name: 'Combo Keeper', desc: 'Combos last 8% longer', apply: u => u.comboTime *= 1.08,
+    now: u => `combo window ${pct(u.comboTime, BASE_UP.comboTime)}` },
+  { id: 'ram', name: 'Battering Ram', desc: 'Dash hits on bosses deal 15% more', apply: u => u.bossDmg += 0.15,
+    now: u => `boss damage ${pct(u.bossDmg, BASE_UP.bossDmg)}` },
+  { id: 'swift', name: 'Swift', desc: 'Move 3% faster', apply: u => u.speed *= 1.03,
+    now: u => `speed ${pct(u.speed, BASE_UP.speed)}` },
+  { id: 'life', name: 'Nine Lives', desc: '4 shards = survive one fatal hit',
+    apply: u => { if (++u.lifeBits % 4 === 0) u.lives++; },
+    now: u => `${u.lives} spare li${u.lives === 1 ? 'fe' : 'ves'} · shard ${u.lifeBits % 4}/4` },
+];
+const BOSSES = [
+  { kind: 'splitter', name: 'BLOBZILLA', hue: 335, desc: 'spawns hunters when hit' },
+  { kind: 'spitter', name: 'SPITBALL', hue: 12, desc: 'spits spiky shots' },
+  { kind: 'vortex', name: 'THE DRAIN', hue: 250, desc: 'pulls you in' },
+  { kind: 'charger', name: 'RAMSAY', hue: 35, desc: 'charges at you' },
+];
+
+let mode = 'title'; // title | play | pick | dead
+let paused = false; // freezes play without leaving it
 let player, blobs, parts, texts, shake, combo, comboTimer, deadTimer, deathMsg;
 let tier, maxTier, camS, score, invuln, dashT, dashCd, power, banner, flash, bgFrom, bgT;
+let boss, cleared, clearT, shots, up, taken, choices, pickTimer, dashCharges, knockT;
 const stars = Array.from({ length: 140 }, () => ({ x: rand(0, 1), y: rand(0, 1), d: rand(0.1, 1) }));
 
 function reset() {
   player = { x: 0, y: 0, r: 10, vx: 0, vy: 0, wob: 0 };
+  paused = false;
   blobs = []; parts = []; texts = [];
   shake = 0; combo = 0; comboTimer = 0;
   tier = 0; maxTier = 0; score = 0; invuln = 0;
-  dashT = 0; dashCd = 0; power = null; banner = null; flash = 0;
+  dashT = 0; dashCd = 0; knockT = 0; power = null; banner = null; flash = 0;
   bgFrom = 0; bgT = 1;
+  boss = null; cleared = false; clearT = 0; shots = []; choices = null; pickTimer = 0;
+  up = { ...BASE_UP };
+  taken = {}; dashCharges = up.charges;
   camS = targetScale();
   for (let i = 0; i < 45; i++) spawn(true);
 }
@@ -99,7 +152,7 @@ function spawn(anywhere) {
   const roll = Math.random();
   const t = Math.min(tier, 8);
   let type = 'normal', k;
-  if (roll < 0.03) { type = 'gold'; k = 0.5; }
+  if (roll < up.gold) { type = 'gold'; k = 0.5; }
   else if (tier >= 1 && roll < 0.03 + 0.07 + t * 0.015) { type = 'spike'; k = rand(0.4, 1.4); }
   else if (tier >= 2 && roll < 0.1 + t * 0.035) { type = 'dasher'; k = rand(1.1, 1.8); }
   else k = Math.random() < 0.7 - t * 0.03 ? rand(0.25, 0.9) : rand(1.1, 2.6);
@@ -112,20 +165,192 @@ function spawn(anywhere) {
 }
 
 function onTap() {
+  if (paused) { paused = false; return; }
   if (mode === 'title' || (mode === 'dead' && deadTimer > 0.8)) {
     reset(); mode = 'play'; blip(440, 0.12, 'triangle');
-  } else if (mode === 'play' && dashCd <= 0) {
+  } else if (mode === 'pick') {
+    const i = cardRects().findIndex(r => inRect(mouse, r));
+    if (i >= 0) choose(i);
+  } else if (mode === 'play' && dashCharges > 0) {
     const dx = mouse.x - W / 2, dy = mouse.y - H / 2;
     const len = Math.hypot(dx, dy) || 1;
     player.vx = (dx / len) * 950 / camS;
     player.vy = (dy / len) * 950 / camS;
-    dashT = 0.25; dashCd = 1.4;
+    if (dashCharges === up.charges) dashCd = up.dashCd;
+    dashCharges--; dashT = 0.25;
     blip(180, 0.18, 'square', 0.06, 3);
+  }
+}
+
+function startPick() {
+  const pool = UPGRADES.slice();
+  choices = [];
+  while (choices.length < 3 && pool.length) choices.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
+  mode = 'pick'; pickTimer = 0;
+}
+
+function choose(i) {
+  if (pickTimer < 0.5 || !choices[i]) return;
+  const u = choices[i];
+  const had = up.charges;
+  u.apply(up);
+  taken[u.id] = (taken[u.id] || 0) + 1;
+  dashCharges += up.charges - had;
+  choices = null; mode = 'play';
+  blip(660, 0.15, 'triangle', 0.12, 1.5);
+}
+
+function cardRects() {
+  const n = choices ? choices.length : 0;
+  if (W > 720) {
+    const w = 210, h = 230, gap = 20, x0 = W / 2 - (n * w + (n - 1) * gap) / 2;
+    return Array.from({ length: n }, (_, i) => ({ x: x0 + i * (w + gap), y: H / 2 - h / 2 + 30, w, h }));
+  }
+  const w = Math.min(W - 32, 360), h = 112, gap = 12, y0 = H / 2 - (n * h + (n - 1) * gap) / 2 + 30;
+  return Array.from({ length: n }, (_, i) => ({ x: W / 2 - w / 2, y: y0 + i * (h + gap), w, h }));
+}
+const inRect = (p, r) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+
+// ---------- bosses ----------
+function spawnBoss() {
+  // guards the end of the current stage; lvl matches the stage it unlocks
+  const lvl = tier + 1;
+  const def = BOSSES[tier % BOSSES.length];
+  const a = rand(0, Math.PI * 2), d = viewR() * 0.95;
+  const hp = Math.round(4 + lvl * 1.5);
+  boss = {
+    ...def, lvl, x: player.x + Math.cos(a) * d, y: player.y + Math.sin(a) * d, r: player.r * 4,
+    vx: 0, vy: 0, hp, maxHp: hp, st: 'idle', t: 2, stun: 0, hitCd: 0, flash: 0, ph: 0, shootT: 2,
+  };
+  banner = { text: `BOSS: ${def.name}`, sub: `${def.desc} · DASH into it to clear the ${stageName(tier)}`, t: 3 };
+  arp([196, 185, 175, 165], 120, 'sawtooth');
+  shake = 10;
+}
+
+function updateBoss(dt, vr) {
+  if (!boss) return;
+  const b = boss, s = camS;
+  b.ph += dt * 1.5; b.flash *= 0.9; b.hitCd -= dt;
+  const dx = player.x - b.x, dy = player.y - b.y;
+  const d = Math.hypot(dx, dy) || 1, nx = dx / d, ny = dy / d;
+  const t = Math.min(b.lvl, 10);
+  let max = (150 + t * 10) / s;
+  const pull = 160 / s;
+  if (mode !== 'play') { b.vx *= 0.95; b.vy *= 0.95; }
+  else if ((b.stun -= dt) > 0) { b.vx *= 0.9; b.vy *= 0.9; }
+  else {
+    if (b.kind === 'splitter') max *= 1.25;
+    if (b.kind === 'vortex') {
+      max *= 0.55;
+      const reach = vr * 0.9;
+      if (d < reach) {
+        const f = (0.3 + 0.7 * (1 - d / reach)) * 170 / s;
+        player.x -= nx * f * dt; player.y -= ny * f * dt;
+      }
+    }
+    if (b.kind === 'charger') {
+      if (b.st === 'idle') {
+        b.vx += nx * pull * 0.6 * dt; b.vy += ny * pull * 0.6 * dt;
+        if ((b.t -= dt) <= 0 && d < vr * 0.6) { b.st = 'charge'; b.t = 0.8; }
+      } else if (b.st === 'charge') {
+        b.vx *= 0.85; b.vy *= 0.85;
+        if ((b.t -= dt) <= 0) {
+          b.st = 'dash'; b.t = 0.7;
+          b.vx = nx * 900 / s; b.vy = ny * 900 / s;
+          blip(90, 0.35, 'sawtooth', 0.1, 2.5);
+        }
+      } else {
+        max = 950 / s;
+        if ((b.t -= dt) <= 0) { b.st = 'idle'; b.t = rand(1, 1.8); }
+      }
+    } else {
+      // spitters keep their distance
+      const dir = b.kind === 'spitter' && d < vr * 0.35 ? -0.5 : 1;
+      b.vx += nx * pull * dir * dt; b.vy += ny * pull * dir * dt;
+    }
+    const shoots = b.kind === 'spitter' || b.lvl >= 5;
+    if (shoots && (b.shootT -= dt) <= 0) {
+      b.shootT = b.kind === 'spitter' ? Math.max(0.9, 1.8 - t * 0.08) * 1.25 : 3;
+      const n = b.kind === 'spitter' ? 3 : 1, base = Math.atan2(dy, dx);
+      for (let k = 0; k < n; k++) {
+        const a = base + (k - (n - 1) / 2) * 0.3;
+        shots.push({
+          x: b.x + Math.cos(a) * b.r, y: b.y + Math.sin(a) * b.r,
+          vx: Math.cos(a) * 380 / s, vy: Math.sin(a) * 380 / s, r: player.r * 0.35, life: 3,
+        });
+      }
+      blip(500, 0.08, 'square', 0.06, 0.6);
+    }
+  }
+  if (d > vr * 1.3) { max *= 3; b.vx += nx * pull * 3 * dt; b.vy += ny * pull * 3 * dt; }
+  const bs = Math.hypot(b.vx, b.vy);
+  if (bs > max) { b.vx *= max / bs; b.vy *= max / bs; }
+  b.x += b.vx * dt; b.y += b.vy * dt;
+
+  if (mode === 'play' && d < player.r + b.r * 0.85) {
+    if (dashT > -0.05 && b.hitCd <= 0) hitBoss(nx, ny);
+    else if (invuln <= 0) hurt(nx, ny);
+  }
+}
+
+function hitBoss(nx, ny) {
+  const b = boss;
+  b.hp -= up.bossDmg; b.hitCd = 0.35; b.stun = 0.6; b.flash = 1;
+  b.vx = -nx * 200 / camS; b.vy = -ny * 200 / camS;
+  player.vx = nx * 650 / camS; player.vy = ny * 650 / camS;
+  knockT = 0.2; dashT = 0; invuln = Math.max(invuln, 0.5);
+  score += 100 * b.lvl;
+  combo++; comboTimer = up.comboTime;
+  shake = 14;
+  burst(b.x + nx * b.r, b.y + ny * b.r, b.r * 0.4, b.hue, 20);
+  texts.push({ x: b.x, y: b.y - b.r, t: 'WHAM!', life: 0.9, big: true });
+  blip(90, 0.2, 'square', 0.15, 0.4);
+  for (let k = 0; k < 3; k++) chunk(b, player.r * rand(0.35, 0.55));
+  if (b.kind === 'splitter') chunk(b, player.r * 1.2);
+  if (b.hp <= 0) killBoss();
+}
+
+function chunk(b, r) {
+  const a = rand(0, 6.28);
+  blobs.push({
+    x: b.x + Math.cos(a) * b.r, y: b.y + Math.sin(a) * b.r, r, type: 'normal',
+    vx: Math.cos(a) * 250 / camS, vy: Math.sin(a) * 250 / camS,
+    ph: rand(0, 6.28), eyes: true, st: 'idle', t: 1,
+  });
+  return blobs[blobs.length - 1];
+}
+
+function killBoss() {
+  const b = boss;
+  boss = null;
+  burst(b.x, b.y, b.r, b.hue, 120);
+  for (let k = 0; k < 8; k++) chunk(b, player.r * rand(0.4, 0.7));
+  Object.assign(chunk(b, player.r * 0.5), { type: 'gold' });
+  player.r = Math.sqrt(player.r * player.r + b.r * b.r * 0.05);
+  score += 2000 * b.lvl;
+  banner = { text: 'BOSS DOWN', sub: `+${(2000 * b.lvl).toLocaleString()}`, t: 1.8 };
+  cleared = true; clearT = 1.8;
+  flash = 1; shake = 30;
+  arp([392, 523, 659, 784, 1047, 1319], 70, 'square');
+}
+
+function updateShots(dt) {
+  for (let i = shots.length - 1; i >= 0; i--) {
+    const p = shots[i];
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    if ((p.life -= dt) <= 0) { shots.splice(i, 1); continue; }
+    const dx = player.x - p.x, dy = player.y - p.y, d = Math.hypot(dx, dy) || 1;
+    if (mode === 'play' && invuln <= 0 && d < player.r + p.r * 0.8) {
+      shots.splice(i, 1);
+      hurt(dx / d, dy / d);
+    }
   }
 }
 
 // ---------- update ----------
 function update(dt) {
+  if (paused) return;
+  if (mode === 'pick') { pickTimer += dt; return; }
   camS *= Math.pow(targetScale() / camS, Math.min(dt * 2.2, 1));
   const s = camS;
   const frenzy = power && power.kind === 'FRENZY';
@@ -134,8 +359,8 @@ function update(dt) {
   if (mode === 'play') {
     const dx = mouse.x - W / 2, dy = mouse.y - H / 2;
     const len = Math.hypot(dx, dy) || 1;
-    const sp = Math.min(len / 140, 1) * 290 / s;
-    const steer = dashT > 0 ? dt : Math.min(dt * 6, 1);
+    const sp = Math.min(len / 140, 1) * up.speed / s;
+    const steer = dashT > 0 || knockT > 0 ? dt : Math.min(dt * 6, 1);
     player.vx += ((dx / len) * sp - player.vx) * steer;
     player.vy += ((dy / len) * sp - player.vy) * steer;
     if (dashT > 0 && Math.random() < 0.8) {
@@ -145,18 +370,25 @@ function update(dt) {
     player.y += player.vy * dt;
 
     // metabolism: stop eating and you shrink
-    player.r *= 1 - 0.016 * dt;
+    player.r *= 1 - up.shrink * dt;
     if (player.r < 5) die('shrank to nothing');
 
     const tr = tierR(tier);
-    if (player.r > tr * TIER_GROW) {
+    // after the boss-down banner, push the player over the edge into the next stage
+    if (clearT > 0 && (clearT -= dt) <= 0) player.r = Math.max(player.r, tr * TIER_GROW * 1.01);
+    if (player.r > tr * TIER_GROW && tier === maxTier && (!cleared || clearT > 0)) {
+      // end of the newest stage: hold here until its boss is beaten
+      player.r = tr * TIER_GROW;
+      if (!boss && !cleared) spawnBoss();
+    } else if (player.r > tr * TIER_GROW) {
       bgFrom = tier; bgT = 0; tier++;
       if (tier > maxTier) {
-        maxTier = tier;
+        maxTier = tier; cleared = false;
         score += 500 * tier;
         banner = { text: `STAGE ${tier + 1}`, sub: stageName(tier), t: 2.8 };
         flash = 1;
         arp([523, 659, 784, 1047], 90);
+        startPick();
       }
     } else if (tier > 0 && player.r < tr * 0.7) {
       bgFrom = tier; bgT = 0; tier--;
@@ -165,7 +397,8 @@ function update(dt) {
     player.vx *= 0.95; player.vy *= 0.95;
   }
   player.wob += dt;
-  dashT -= dt; dashCd -= dt; invuln -= dt; flash *= 0.92;
+  dashT -= dt; knockT -= dt; invuln -= dt; flash *= 0.92;
+  if (dashCharges < up.charges && (dashCd -= dt) <= 0) { dashCharges++; dashCd = up.dashCd; }
   bgT = Math.min(bgT + dt * 0.7, 1);
   if (banner && (banner.t -= dt) <= 0) banner = null;
   if (power && (power.t -= dt) <= 0) { power = null; blip(300, 0.2, 'triangle', 0.1, 0.5); }
@@ -174,8 +407,10 @@ function update(dt) {
   if (comboTimer <= 0) combo = 0;
 
   const vr = viewR();
-  const huntPull = (110 + Math.min(tier, 8) * 18) / s;
-  const huntMax = (170 + Math.min(tier, 8) * 14) / s;
+  // hunters keep creeping faster past tier 8, so Swift picks stay relevant late
+  const late = Math.max(tier - 8, 0);
+  const huntPull = (110 + Math.min(tier, 8) * 18 + late * 8) / s;
+  const huntMax = (170 + Math.min(tier, 8) * 14 + late * 6) / s;
   for (let i = blobs.length - 1; i >= 0; i--) {
     const b = blobs[i];
     b.ph += dt * 2;
@@ -190,7 +425,7 @@ function update(dt) {
       } else if (b.type === 'gold') {
         b.vx -= (dx / d) * 300 / s * dt; b.vy -= (dy / d) * 300 / s * dt;
         max = 260 / s;
-      } else if (edible && magnet) {
+      } else if (edible && (magnet || (up.magnet && d < player.r * (2.2 + up.magnet * 0.8)))) {
         b.vx += (dx / d) * 700 / s * dt; b.vy += (dy / d) * 700 / s * dt;
         max = 450 / s;
       } else if (edible) {
@@ -223,12 +458,14 @@ function update(dt) {
     if (d > vr * 2.2) { blobs.splice(i, 1); continue; }
 
     if (mode === 'play' && d < player.r + b.r * 0.6) {
-      if (b.type === 'spike') { if (invuln <= 0) hurt(b, dx / d, dy / d); }
+      if (b.type === 'spike') { if (invuln <= 0) hurt(dx / d, dy / d); }
       else if (edible) eat(b, i);
       else if (d < player.r * 0.6 + b.r && invuln <= 0) die(b.type === 'dasher' ? 'got rammed' : 'got NOMMED');
     }
   }
-  while (blobs.length < 45) spawn(false);
+  updateBoss(dt, vr);
+  updateShots(dt);
+  while (blobs.length < (boss ? 32 : 45)) spawn(false);
 
   for (let i = parts.length - 1; i >= 0; i--) {
     const p = parts[i];
@@ -247,13 +484,13 @@ function update(dt) {
 
 function eat(b, i) {
   blobs.splice(i, 1);
-  player.r = Math.sqrt(player.r * player.r + b.r * b.r * 0.45);
-  combo++; comboTimer = 1.2;
+  player.r = Math.sqrt(player.r * player.r + b.r * b.r * up.growth);
+  combo++; comboTimer = up.comboTime;
   const pts = Math.round(b.r * combo);
   score += pts;
   burst(b.x, b.y, b.r, b.type === 'gold' ? 50 : 160 + combo * 15, 14);
   if (b.type === 'gold') {
-    power = { kind: Math.random() < 0.5 ? 'FRENZY' : 'MAGNET', t: 6 };
+    power = { kind: Math.random() < 0.5 ? 'FRENZY' : 'MAGNET', t: up.powerDur, dur: up.powerDur };
     combo += 3;
     texts.push({ x: b.x, y: b.y, t: power.kind + '!', life: 1.4, big: true });
     arp([784, 988, 1175, 1568], 60, 'square');
@@ -264,11 +501,11 @@ function eat(b, i) {
   shake = Math.min(shake + 2, 8);
 }
 
-function hurt(b, nx, ny) {
-  player.r *= 0.78;
+function hurt(nx, ny) {
+  player.r *= 1 - up.hurtLoss;
   invuln = 1.2; combo = 0;
   player.vx = nx * 700 / camS; player.vy = ny * 700 / camS;
-  dashT = 0.2;
+  knockT = 0.2; dashT = 0;
   burst(player.x, player.y, player.r, 290, 25);
   texts.push({ x: player.x, y: player.y, t: 'OUCH', life: 0.9 });
   shake = 16;
@@ -277,6 +514,14 @@ function hurt(b, nx, ny) {
 
 function die(msg) {
   if (mode !== 'play') return;
+  if (up.lives > 0) {
+    up.lives--;
+    invuln = 2.5; player.r = Math.max(player.r * 0.7, 7);
+    banner = { text: 'SECOND LIFE', sub: 'used it. careful now.', t: 2 };
+    flash = 1; shake = 20;
+    arp([784, 659, 523], 80);
+    return;
+  }
   mode = 'dead'; deadTimer = 0; deathMsg = msg; power = null;
   burst(player.x, player.y, player.r, 50, 80);
   shake = 30; boom();
@@ -402,6 +647,16 @@ function draw() {
     if (danger || b.eyes || b.type === 'gold') drawEyes(sx, sy, r, W / 2 - sx, H / 2 - sy, danger);
   }
 
+  if (boss) drawBoss(toS, now);
+  for (const p of shots) {
+    const [sx, sy] = toS(p.x, p.y);
+    g.fillStyle = '#ff4d6d';
+    g.shadowColor = '#ff4d6d'; g.shadowBlur = 15;
+    spikePath(sx, sy, p.r * s, now / 100);
+    g.fill();
+  }
+  g.shadowBlur = 0;
+
   for (const p of parts) {
     const [sx, sy] = toS(p.x, p.y);
     g.globalAlpha = Math.max(p.life, 0);
@@ -420,12 +675,18 @@ function draw() {
     g.translate(W / 2, H / 2);
     // dash readiness ring
     if (mode === 'play') {
-      const ready = dashCd <= 0;
+      const ready = dashCharges > 0, full = dashCharges >= up.charges;
       g.strokeStyle = ready ? 'rgba(255,209,102,0.5)' : 'rgba(255,255,255,0.15)';
       g.lineWidth = 3;
       g.beginPath();
-      g.arc(0, 0, r * 1.25 + 4, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (ready ? 1 : 1 - dashCd / 1.4));
+      g.arc(0, 0, r * 1.25 + 4, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (full ? 1 : 1 - dashCd / up.dashCd));
       g.stroke();
+      if (up.charges > 1) {
+        for (let k = 0; k < up.charges; k++) {
+          g.fillStyle = k < dashCharges ? '#ffd166' : 'rgba(255,255,255,0.2)';
+          g.beginPath(); g.arc((k - (up.charges - 1) / 2) * 12, r * 1.25 + 14, 4, 0, 7); g.fill();
+        }
+      }
     }
     g.rotate(ang); g.scale(squish, 1 / squish); g.rotate(-ang);
     const pg = g.createRadialGradient(-r * 0.3, -r * 0.3, r * 0.1, 0, 0, r);
@@ -454,15 +715,12 @@ function draw() {
       if (sx > -r && sy > -r && sx < W + r && sy < H + r) continue;
       const d = Math.hypot(b.x - player.x, b.y - player.y);
       if (d > viewR() * 1.1) continue;
-      const a = Math.atan2(sy - H / 2, sx - W / 2);
-      const ex = Math.min(Math.max(W / 2 + Math.cos(a) * W, 18), W - 18);
-      const ey = Math.min(Math.max(H / 2 + Math.sin(a) * H, 18), H - 18);
-      g.save();
-      g.translate(ex, ey); g.rotate(a);
-      g.fillStyle = b.type === 'dasher' ? '#ff8c42' : '#ff3355';
-      g.globalAlpha = 0.5 + 0.5 * Math.sin(now / 100);
-      g.beginPath(); g.moveTo(12, 0); g.lineTo(-8, -9); g.lineTo(-8, 9); g.fill();
-      g.restore();
+      edgeArrow(sx, sy, b.type === 'dasher' ? '#ff8c42' : '#ff3355', 1, now);
+    }
+    if (boss) {
+      const [sx, sy] = toS(boss.x, boss.y);
+      const r = boss.r * s;
+      if (sx < -r || sy < -r || sx > W + r || sy > H + r) edgeArrow(sx, sy, `hsl(${boss.hue},90%,60%)`, 2, now);
     }
   }
 
@@ -507,7 +765,17 @@ function draw() {
       g.font = 'bold 18px system-ui, sans-serif';
       g.fillStyle = power.kind === 'FRENZY' ? '#4cc9f0' : '#9bf6ff';
       g.fillText(power.kind === 'FRENZY' ? 'FRENZY — eat EVERYTHING' : 'MAGNET', W / 2, 34);
-      g.fillRect(W / 2 - 80, 42, 160 * (power.t / 6), 5);
+      g.fillRect(W / 2 - 80, 42, 160 * (power.t / power.dur), 5);
+    }
+    if (boss) {
+      const bw = Math.min(360, W - 40), bx = W / 2 - bw / 2, by = H - 36;
+      g.textAlign = 'center';
+      g.font = 'bold 16px system-ui, sans-serif';
+      g.fillStyle = '#fff';
+      g.fillText(boss.name, W / 2, by - 8);
+      g.fillStyle = 'rgba(255,255,255,0.15)'; g.fillRect(bx, by, bw, 10);
+      g.fillStyle = `hsl(${boss.hue},85%,60%)`;
+      g.fillRect(bx, by, bw * Math.max(boss.hp, 0) / boss.maxHp, 10);
     }
   }
 
@@ -524,14 +792,180 @@ function draw() {
     small('steer with mouse · click / space to DASH', H / 2);
     small('eat teal · flee red · never touch purple spikes', H / 2 + 28);
     small('gold = powers · stop eating and you shrink', H / 2 + 56);
-    small('click / tap to start', H / 2 + 100, 0.5 + 0.5 * Math.sin(now / 300));
-    if (best) small(`best ${best.toLocaleString()}`, H / 2 + 136, 0.6);
+    small('level up to pick upgrades · DASH into bosses · P to pause', H / 2 + 84);
+    small('click / tap to start', H / 2 + 128, 0.5 + 0.5 * Math.sin(now / 300));
+    if (best) small(`best ${best.toLocaleString()}`, H / 2 + 164, 0.6);
   } else if (mode === 'dead') {
     big('NOMMED', H / 2 - 50, 90);
     small(`you ${deathMsg} in the ${stageName(tier)}`, H / 2 + 10);
     small(`score ${score.toLocaleString()}  ·  best ${best.toLocaleString()}`, H / 2 + 40);
     if (deadTimer > 0.8) small('click / tap to go again', H / 2 + 80, 0.5 + 0.5 * Math.sin(now / 300));
+  } else if (mode === 'pick') {
+    drawPick();
+  } else if (paused) {
+    g.fillStyle = 'rgba(5,3,20,0.6)';
+    g.fillRect(0, 0, W, H);
+    big('PAUSED', H / 2 - 20, 80);
+    small('press P or click to resume', H / 2 + 30, 0.5 + 0.5 * Math.sin(now / 300));
   }
+}
+
+function drawPick() {
+  g.fillStyle = 'rgba(5,3,20,0.75)';
+  g.fillRect(0, 0, W, H);
+  const rects = cardRects();
+  const top = rects[0].y;
+  g.textAlign = 'center';
+  big(`STAGE ${tier + 1}`, top - 50, 52);
+  small(`${stageName(tier)} · choose an upgrade (click or 1 / 2 / 3)`, top - 16, 0.75);
+  rects.forEach((r, i) => {
+    const u = choices[i], hover = inRect(mouse, r) && pickTimer > 0.5;
+    g.fillStyle = hover ? 'rgba(255,209,102,0.18)' : 'rgba(255,255,255,0.07)';
+    g.strokeStyle = hover ? '#ffd166' : 'rgba(255,255,255,0.25)';
+    g.lineWidth = 2;
+    g.beginPath(); g.roundRect(r.x, r.y, r.w, r.h, 14); g.fill(); g.stroke();
+    const lv = (taken[u.id] || 0) + 1, tall = r.h > 150;
+    const tx = tall ? r.x + r.w / 2 : r.x + 18;
+    g.textAlign = tall ? 'center' : 'left';
+    g.fillStyle = 'rgba(255,255,255,0.45)';
+    g.font = '14px system-ui, sans-serif';
+    g.fillText(`${i + 1}${lv > 1 ? ' · Lv ' + lv : ''}`, tx, r.y + (tall ? 34 : 26));
+    g.fillStyle = '#ffd166';
+    g.font = 'bold 22px system-ui, sans-serif';
+    g.fillText(u.name, tx, r.y + (tall ? 92 : 52));
+    g.fillStyle = 'rgba(255,255,255,0.85)';
+    g.font = '16px system-ui, sans-serif';
+    wrap(u.desc, tx, r.y + (tall ? 130 : 76), r.w - 36, 22);
+    g.fillStyle = 'rgba(255,209,102,0.6)';
+    g.font = '13px system-ui, sans-serif';
+    g.fillText(u.now(up), tx, r.y + (tall ? r.h - 22 : 100));
+  });
+  const build = UPGRADES.filter(u => taken[u.id]).map(u => `${u.name} ${taken[u.id]}`).join(' · ');
+  if (build) {
+    const last = rects[rects.length - 1];
+    g.textAlign = 'center';
+    g.fillStyle = 'rgba(255,255,255,0.55)';
+    g.font = '13px system-ui, sans-serif';
+    wrap(build, W / 2, last.y + last.h + 28, Math.min(W - 32, 680), 18);
+  }
+}
+
+function wrap(text, x, y, maxW, lh) {
+  let line = '';
+  for (const w of text.split(' ')) {
+    const t = line ? line + ' ' + w : w;
+    if (line && g.measureText(t).width > maxW) { g.fillText(line, x, y); line = w; y += lh; }
+    else line = t;
+  }
+  g.fillText(line, x, y);
+}
+
+function edgeArrow(sx, sy, color, size, now) {
+  const a = Math.atan2(sy - H / 2, sx - W / 2);
+  const ex = Math.min(Math.max(W / 2 + Math.cos(a) * W, 18 * size), W - 18 * size);
+  const ey = Math.min(Math.max(H / 2 + Math.sin(a) * H, 18 * size), H - 18 * size);
+  g.save();
+  g.translate(ex, ey); g.rotate(a); g.scale(size, size);
+  g.fillStyle = color;
+  g.globalAlpha = 0.5 + 0.5 * Math.sin(now / 100);
+  g.beginPath(); g.moveTo(12, 0); g.lineTo(-8, -9); g.lineTo(-8, 9); g.fill();
+  g.restore();
+}
+
+function drawBoss(toS, now) {
+  const b = boss;
+  let [sx, sy] = toS(b.x, b.y);
+  const r = b.r * camS;
+  const rage = b.st === 'charge' ? 1 : 0;
+  if (rage) { sx += rand(-5, 5); sy += rand(-5, 5); }
+  if (b.kind === 'vortex') {
+    g.strokeStyle = `hsla(${b.hue},90%,70%,0.25)`;
+    g.lineWidth = 3;
+    for (let k = 0; k < 4; k++) {
+      const rr = r * (1.2 + (1 - ((now / 900 + k / 4) % 1)) * 2.5);
+      g.beginPath(); g.arc(sx, sy, rr, 0, 7); g.stroke();
+    }
+  }
+  // pulsing aura
+  const pulse = 0.5 + 0.5 * Math.sin(now / 180);
+  const aura = g.createRadialGradient(sx, sy, r * 0.8, sx, sy, r * (1.7 + pulse * 0.25));
+  aura.addColorStop(0, `hsla(${b.hue},100%,45%,${0.4 + rage * 0.3})`);
+  aura.addColorStop(1, `hsla(${b.hue},100%,30%,0)`);
+  g.fillStyle = aura;
+  g.beginPath(); g.arc(sx, sy, r * 2, 0, 7); g.fill();
+  // rotating spike ring behind the body
+  const n = 28, rot = now / 2500;
+  g.fillStyle = `hsl(${b.hue},60%,20%)`;
+  g.beginPath();
+  for (let k = 0; k <= n; k++) {
+    const a = rot + (k / n) * Math.PI * 2;
+    const rr = k % 2 ? r * 0.95 : r * (1.22 + 0.05 * Math.sin(now / 120 + k));
+    const px = sx + Math.cos(a) * rr, py = sy + Math.sin(a) * rr;
+    k ? g.lineTo(px, py) : g.moveTo(px, py);
+  }
+  g.closePath(); g.fill();
+  // horns
+  g.fillStyle = '#efe2c4'; g.strokeStyle = '#2a0a0a'; g.lineWidth = r * 0.04;
+  for (const side of [-1, 1]) {
+    g.beginPath();
+    g.moveTo(sx + side * r * 0.2, sy - r * 0.85);
+    g.quadraticCurveTo(sx + side * r * 0.5, sy - r * 1.3, sx + side * r * 1.0, sy - r * 1.45);
+    g.quadraticCurveTo(sx + side * r * 0.75, sy - r * 1.0, sx + side * r * 0.7, sy - r * 0.6);
+    g.closePath(); g.fill(); g.stroke();
+  }
+  // body: dark-rimmed, lit from above
+  if (b.flash > 0.1) g.fillStyle = '#fff';
+  else {
+    const body = g.createRadialGradient(sx, sy - r * 0.3, r * 0.1, sx, sy, r * 1.05);
+    body.addColorStop(0, `hsl(${b.hue},75%,${42 + rage * 15}%)`);
+    body.addColorStop(1, `hsl(${b.hue},85%,16%)`);
+    g.fillStyle = body;
+  }
+  g.shadowColor = `hsl(${b.hue},100%,50%)`;
+  g.shadowBlur = 40;
+  blobPath(sx, sy, r, b.ph);
+  g.fill();
+  g.shadowBlur = 0;
+  // glowing slit eyes under a scowling brow
+  const lx = W / 2 - sx, ly = H / 2 - sy, ll = Math.hypot(lx, ly) || 1;
+  const ox = (lx / ll) * r * 0.06, oy = (ly / ll) * r * 0.05;
+  for (const side of [-1, 1]) {
+    const ex = sx + side * r * 0.33, ey = sy - r * 0.2;
+    g.fillStyle = rage ? '#fff3a0' : '#ffd23f';
+    g.shadowColor = '#ff2a00'; g.shadowBlur = 25;
+    g.beginPath(); g.ellipse(ex, ey, r * 0.18, r * 0.12, side * 0.35, 0, 7); g.fill();
+    g.shadowBlur = 0;
+    g.fillStyle = '#120000';
+    g.beginPath(); g.ellipse(ex + ox, ey + oy, r * 0.035, r * 0.1, 0, 0, 7); g.fill();
+    g.beginPath();
+    g.moveTo(ex - side * r * 0.24, ey - r * 0.02);
+    g.lineTo(ex + side * r * 0.27, ey - r * 0.3);
+    g.lineTo(ex + side * r * 0.27, ey - r * 0.15);
+    g.closePath(); g.fill();
+  }
+  // jagged grin; gapes wider while winding up a charge
+  const mw = r * 0.55, edge = sy + r * 0.3;
+  const sag = r * 0.14, gape = r * (0.34 + rage * 0.3 + 0.06 * Math.sin(now / 150));
+  const xAt = u => sx - mw + 2 * mw * u;
+  const topAt = u => edge + 2 * u * (1 - u) * sag;
+  const botAt = u => edge + 2 * u * (1 - u) * gape;
+  g.fillStyle = '#1a0000';
+  g.beginPath();
+  g.moveTo(sx - mw, edge);
+  g.quadraticCurveTo(sx, edge + sag, sx + mw, edge);
+  g.quadraticCurveTo(sx, edge + gape, sx - mw, edge);
+  g.fill();
+  g.fillStyle = '#f4ecd8';
+  const nt = 7;
+  g.beginPath();
+  for (let k = 0; k < nt; k++) {
+    const u0 = k / nt, u1 = (k + 1) / nt, um = (u0 + u1) / 2;
+    g.moveTo(xAt(u0), topAt(u0)); g.lineTo(xAt(u1), topAt(u1)); g.lineTo(xAt(um), topAt(um) + r * 0.1);
+    if (k > 0 && k < nt - 1) {
+      g.moveTo(xAt(u0), botAt(u0)); g.lineTo(xAt(u1), botAt(u1)); g.lineTo(xAt(um), botAt(um) - r * 0.07);
+    }
+  }
+  g.fill();
 }
 
 function big(t, y, size) {
