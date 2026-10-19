@@ -1,0 +1,563 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>NOM</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0820; touch-action: none; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// NOM — eat smaller blobs, flee bigger ones, dodge spikes. Grow through the stages.
+const c = document.getElementById('c');
+const g = c.getContext('2d');
+let W, H, DPR;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  c.width = W * DPR; c.height = H * DPR;
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+addEventListener('resize', resize);
+resize();
+
+// ---------- input ----------
+const mouse = { x: W / 2, y: H / 2 };
+function setPointer(e) { mouse.x = e.clientX; mouse.y = e.clientY; }
+addEventListener('pointermove', setPointer);
+addEventListener('pointerdown', e => { setPointer(e); onTap(); });
+addEventListener('keydown', e => { if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); onTap(); } });
+
+// ---------- audio ----------
+let ac;
+function blip(freq, dur = 0.08, type = 'sine', vol = 0.15, slide = 1.8) {
+  try {
+    ac = ac || new (window.AudioContext || window.webkitAudioContext)();
+    const o = ac.createOscillator(), v = ac.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(freq, ac.currentTime);
+    o.frequency.exponentialRampToValueAtTime(freq * slide, ac.currentTime + dur);
+    v.gain.setValueAtTime(vol, ac.currentTime);
+    v.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
+    o.connect(v).connect(ac.destination);
+    o.start(); o.stop(ac.currentTime + dur);
+  } catch (_) {}
+}
+const arp = (notes, gap, type = 'triangle') => notes.forEach((f, i) => setTimeout(() => blip(f, 0.15, type, 0.12, 1), i * gap));
+const boom = () => { for (let i = 0; i < 6; i++) setTimeout(() => blip(220 - i * 30, 0.15, 'sawtooth', 0.12), i * 40); };
+
+// ---------- stages ----------
+const STAGES = [
+  { name: 'Petri Dish', a: '#1d1446', b: '#07051a' },
+  { name: 'Puddle', a: '#0f2a4a', b: '#030a18' },
+  { name: 'Pond', a: '#0d3b2e', b: '#021410' },
+  { name: 'Reef', a: '#0b3d5c', b: '#011421' },
+  { name: 'Deep Sea', a: '#06142e', b: '#000208' },
+  { name: 'Planet', a: '#3a1a0f', b: '#120502' },
+  { name: 'Solar System', a: '#2e1f00', b: '#0a0600' },
+  { name: 'Galaxy', a: '#2a0f3d', b: '#08010f' },
+  { name: 'The Void', a: '#1a1a1a', b: '#000000' },
+];
+const stageOf = t => STAGES[Math.min(t, STAGES.length - 1)];
+const stageName = t => stageOf(t).name + (t >= STAGES.length ? ` ${t - STAGES.length + 2}` : '');
+const TIER_GROW = 2.5;
+const tierR = t => 10 * Math.pow(TIER_GROW, t);
+// camera zooms in tiers, so you visibly grow on screen until the next zoom-out
+const targetScale = () => Math.min(W, H) * 0.03 / tierR(tier);
+
+// ---------- state ----------
+const rand = (a, b) => a + Math.random() * (b - a);
+let best = 0;
+try { best = +localStorage.getItem('nom-best2') || 0; } catch (_) {}
+
+let mode = 'title'; // title | play | dead
+let player, blobs, parts, texts, shake, combo, comboTimer, deadTimer, deathMsg;
+let tier, maxTier, camS, score, invuln, dashT, dashCd, power, banner, flash, bgFrom, bgT;
+const stars = Array.from({ length: 140 }, () => ({ x: rand(0, 1), y: rand(0, 1), d: rand(0.1, 1) }));
+
+function reset() {
+  player = { x: 0, y: 0, r: 10, vx: 0, vy: 0, wob: 0 };
+  blobs = []; parts = []; texts = [];
+  shake = 0; combo = 0; comboTimer = 0;
+  tier = 0; maxTier = 0; score = 0; invuln = 0;
+  dashT = 0; dashCd = 0; power = null; banner = null; flash = 0;
+  bgFrom = 0; bgT = 1;
+  camS = targetScale();
+  for (let i = 0; i < 45; i++) spawn(true);
+}
+
+const viewR = () => Math.hypot(W, H) / 2 / camS;
+
+function spawn(anywhere) {
+  const vr = viewR();
+  const a = rand(0, Math.PI * 2);
+  const d = anywhere ? rand(player.r * 5, vr * 1.4) : rand(vr * 1.1, vr * 1.6);
+  const roll = Math.random();
+  const t = Math.min(tier, 8);
+  let type = 'normal', k;
+  if (roll < 0.03) { type = 'gold'; k = 0.5; }
+  else if (tier >= 1 && roll < 0.03 + 0.07 + t * 0.015) { type = 'spike'; k = rand(0.4, 1.4); }
+  else if (tier >= 2 && roll < 0.1 + t * 0.035) { type = 'dasher'; k = rand(1.1, 1.8); }
+  else k = Math.random() < 0.7 - t * 0.03 ? rand(0.25, 0.9) : rand(1.1, 2.6);
+  const r = player.r * k;
+  blobs.push({
+    x: player.x + Math.cos(a) * d, y: player.y + Math.sin(a) * d, r, type,
+    vx: rand(-1, 1) * r * 0.6, vy: rand(-1, 1) * r * 0.6,
+    ph: rand(0, 6.28), eyes: Math.random() < 0.5, st: 'idle', t: rand(0.5, 2),
+  });
+}
+
+function onTap() {
+  if (mode === 'title' || (mode === 'dead' && deadTimer > 0.8)) {
+    reset(); mode = 'play'; blip(440, 0.12, 'triangle');
+  } else if (mode === 'play' && dashCd <= 0) {
+    const dx = mouse.x - W / 2, dy = mouse.y - H / 2;
+    const len = Math.hypot(dx, dy) || 1;
+    player.vx = (dx / len) * 950 / camS;
+    player.vy = (dy / len) * 950 / camS;
+    dashT = 0.25; dashCd = 1.4;
+    blip(180, 0.18, 'square', 0.06, 3);
+  }
+}
+
+// ---------- update ----------
+function update(dt) {
+  camS *= Math.pow(targetScale() / camS, Math.min(dt * 2.2, 1));
+  const s = camS;
+  const frenzy = power && power.kind === 'FRENZY';
+  const magnet = power && power.kind === 'MAGNET';
+
+  if (mode === 'play') {
+    const dx = mouse.x - W / 2, dy = mouse.y - H / 2;
+    const len = Math.hypot(dx, dy) || 1;
+    const sp = Math.min(len / 140, 1) * 290 / s;
+    const steer = dashT > 0 ? dt : Math.min(dt * 6, 1);
+    player.vx += ((dx / len) * sp - player.vx) * steer;
+    player.vy += ((dy / len) * sp - player.vy) * steer;
+    if (dashT > 0 && Math.random() < 0.8) {
+      parts.push({ x: player.x, y: player.y, vx: 0, vy: 0, r: player.r * rand(0.3, 0.6), hue: 45, life: 0.3 });
+    }
+    player.x += player.vx * dt;
+    player.y += player.vy * dt;
+
+    // metabolism: stop eating and you shrink
+    player.r *= 1 - 0.016 * dt;
+    if (player.r < 5) die('shrank to nothing');
+
+    const tr = tierR(tier);
+    if (player.r > tr * TIER_GROW) {
+      bgFrom = tier; bgT = 0; tier++;
+      if (tier > maxTier) {
+        maxTier = tier;
+        score += 500 * tier;
+        banner = { text: `STAGE ${tier + 1}`, sub: stageName(tier), t: 2.8 };
+        flash = 1;
+        arp([523, 659, 784, 1047], 90);
+      }
+    } else if (tier > 0 && player.r < tr * 0.7) {
+      bgFrom = tier; bgT = 0; tier--;
+    }
+  } else {
+    player.vx *= 0.95; player.vy *= 0.95;
+  }
+  player.wob += dt;
+  dashT -= dt; dashCd -= dt; invuln -= dt; flash *= 0.92;
+  bgT = Math.min(bgT + dt * 0.7, 1);
+  if (banner && (banner.t -= dt) <= 0) banner = null;
+  if (power && (power.t -= dt) <= 0) { power = null; blip(300, 0.2, 'triangle', 0.1, 0.5); }
+
+  comboTimer -= dt;
+  if (comboTimer <= 0) combo = 0;
+
+  const vr = viewR();
+  const huntPull = (110 + Math.min(tier, 8) * 18) / s;
+  const huntMax = (170 + Math.min(tier, 8) * 14) / s;
+  for (let i = blobs.length - 1; i >= 0; i--) {
+    const b = blobs[i];
+    b.ph += dt * 2;
+    const dx = player.x - b.x, dy = player.y - b.y;
+    const d = Math.hypot(dx, dy) || 1;
+    const edible = b.type !== 'spike' && (b.r < player.r * 0.98 || frenzy);
+    b.edible = edible;
+    let max = huntMax;
+    if (mode === 'play' && d < vr * 0.75) {
+      if (b.type === 'spike') {
+        max = 60 / s;
+      } else if (b.type === 'gold') {
+        b.vx -= (dx / d) * 300 / s * dt; b.vy -= (dy / d) * 300 / s * dt;
+        max = 260 / s;
+      } else if (edible && magnet) {
+        b.vx += (dx / d) * 700 / s * dt; b.vy += (dy / d) * 700 / s * dt;
+        max = 450 / s;
+      } else if (edible) {
+        b.vx -= (dx / d) * 60 / s * dt; b.vy -= (dy / d) * 60 / s * dt;
+        max = (frenzy ? 200 : 150) / s;
+        if (b.type === 'dasher') b.st = 'idle';
+      } else if (b.type === 'dasher') {
+        if (b.st === 'idle') {
+          b.vx += (dx / d) * huntPull * 0.5 * dt; b.vy += (dy / d) * huntPull * 0.5 * dt;
+          if ((b.t -= dt) <= 0 && d < vr * 0.55) { b.st = 'charge'; b.t = 0.7; }
+        } else if (b.st === 'charge') {
+          b.vx *= 0.85; b.vy *= 0.85;
+          if ((b.t -= dt) <= 0) {
+            b.st = 'dash'; b.t = 0.6;
+            b.vx = (dx / d) * 780 / s; b.vy = (dy / d) * 780 / s;
+            blip(120, 0.25, 'sawtooth', 0.07, 2.5);
+          }
+        } else {
+          max = 800 / s;
+          if ((b.t -= dt) <= 0) { b.st = 'idle'; b.t = rand(1.2, 2.2); }
+        }
+      } else {
+        b.vx += (dx / d) * huntPull * dt; b.vy += (dy / d) * huntPull * dt;
+      }
+    } else if (b.type === 'dasher') b.st = 'idle';
+    const bs = Math.hypot(b.vx, b.vy);
+    if (bs > max) { b.vx *= max / bs; b.vy *= max / bs; }
+    b.x += b.vx * dt; b.y += b.vy * dt;
+
+    if (d > vr * 2.2) { blobs.splice(i, 1); continue; }
+
+    if (mode === 'play' && d < player.r + b.r * 0.6) {
+      if (b.type === 'spike') { if (invuln <= 0) hurt(b, dx / d, dy / d); }
+      else if (edible) eat(b, i);
+      else if (d < player.r * 0.6 + b.r && invuln <= 0) die(b.type === 'dasher' ? 'got rammed' : 'got NOMMED');
+    }
+  }
+  while (blobs.length < 45) spawn(false);
+
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vx *= 0.96; p.vy *= 0.96;
+    p.life -= dt;
+    if (p.life <= 0) parts.splice(i, 1);
+  }
+  for (let i = texts.length - 1; i >= 0; i--) {
+    texts[i].life -= dt;
+    if (texts[i].life <= 0) texts.splice(i, 1);
+  }
+  shake *= 0.9;
+  if (mode === 'dead') deadTimer += dt;
+}
+
+function eat(b, i) {
+  blobs.splice(i, 1);
+  player.r = Math.sqrt(player.r * player.r + b.r * b.r * 0.45);
+  combo++; comboTimer = 1.2;
+  const pts = Math.round(b.r * combo);
+  score += pts;
+  burst(b.x, b.y, b.r, b.type === 'gold' ? 50 : 160 + combo * 15, 14);
+  if (b.type === 'gold') {
+    power = { kind: Math.random() < 0.5 ? 'FRENZY' : 'MAGNET', t: 6 };
+    combo += 3;
+    texts.push({ x: b.x, y: b.y, t: power.kind + '!', life: 1.4, big: true });
+    arp([784, 988, 1175, 1568], 60, 'square');
+  } else {
+    texts.push({ x: b.x, y: b.y, t: combo > 1 ? `+${pts} x${combo}` : `+${pts}`, life: 0.9 });
+    blip(330 * Math.pow(1.06, Math.min(combo, 24)), 0.07, 'triangle');
+  }
+  shake = Math.min(shake + 2, 8);
+}
+
+function hurt(b, nx, ny) {
+  player.r *= 0.78;
+  invuln = 1.2; combo = 0;
+  player.vx = nx * 700 / camS; player.vy = ny * 700 / camS;
+  dashT = 0.2;
+  burst(player.x, player.y, player.r, 290, 25);
+  texts.push({ x: player.x, y: player.y, t: 'OUCH', life: 0.9 });
+  shake = 16;
+  blip(140, 0.25, 'square', 0.12, 0.5);
+}
+
+function die(msg) {
+  if (mode !== 'play') return;
+  mode = 'dead'; deadTimer = 0; deathMsg = msg; power = null;
+  burst(player.x, player.y, player.r, 50, 80);
+  shake = 30; boom();
+  if (score > best) { best = score; try { localStorage.setItem('nom-best2', best); } catch (_) {} }
+}
+
+function burst(x, y, r, hue, n) {
+  for (let k = 0; k < n; k++) {
+    const a = rand(0, 6.28), v = rand(0.5, 3) * r;
+    parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, r: rand(0.1, 0.3) * r, hue: hue + rand(-20, 20), life: rand(0.4, 0.9) });
+  }
+}
+
+// ---------- draw ----------
+function blobPath(sx, sy, r, ph) {
+  g.beginPath();
+  const n = 24;
+  for (let k = 0; k <= n; k++) {
+    const a = (k / n) * Math.PI * 2;
+    const rr = r * (1 + 0.06 * Math.sin(a * 3 + ph) + 0.04 * Math.sin(a * 5 - ph * 1.3));
+    const px = sx + Math.cos(a) * rr, py = sy + Math.sin(a) * rr;
+    k ? g.lineTo(px, py) : g.moveTo(px, py);
+  }
+  g.closePath();
+}
+
+function spikePath(sx, sy, r, ph) {
+  g.beginPath();
+  const n = 24;
+  for (let k = 0; k <= n; k++) {
+    const a = (k / n) * Math.PI * 2 + ph * 0.3;
+    const rr = k % 2 ? r * 0.6 : r * 1.15;
+    const px = sx + Math.cos(a) * rr, py = sy + Math.sin(a) * rr;
+    k ? g.lineTo(px, py) : g.moveTo(px, py);
+  }
+  g.closePath();
+}
+
+function drawEyes(sx, sy, r, lookX, lookY, angry) {
+  const len = Math.hypot(lookX, lookY) || 1;
+  const ox = (lookX / len) * r * 0.12, oy = (lookY / len) * r * 0.12;
+  for (const side of [-1, 1]) {
+    const ex = sx + side * r * 0.35, ey = sy - r * 0.15;
+    g.fillStyle = '#fff';
+    g.beginPath(); g.arc(ex, ey, r * 0.22, 0, 7); g.fill();
+    g.fillStyle = '#111';
+    g.beginPath(); g.arc(ex + ox, ey + oy, r * 0.11, 0, 7); g.fill();
+    if (angry) {
+      g.strokeStyle = '#111'; g.lineWidth = r * 0.08;
+      g.beginPath();
+      g.moveTo(ex - side * r * 0.25, ey - r * 0.32);
+      g.lineTo(ex + side * r * 0.15, ey - r * 0.18);
+      g.stroke();
+    }
+  }
+}
+
+function fillBg(st, alpha) {
+  const bg = g.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, Math.hypot(W, H) / 2);
+  bg.addColorStop(0, st.a); bg.addColorStop(1, st.b);
+  g.globalAlpha = alpha;
+  g.fillStyle = bg;
+  g.fillRect(-50, -50, W + 100, H + 100);
+  g.globalAlpha = 1;
+}
+
+function blobColor(b, ratio) {
+  const now = performance.now();
+  if (b.type === 'spike') return 285;
+  if (b.type === 'gold') return 48;
+  if (b.edible) {
+    const frenzy = power && power.kind === 'FRENZY' && b.r >= player.r * 0.98;
+    if (frenzy) return power.t < 1.5 && Math.floor(now / 120) % 2 ? 355 : 220;
+    return 170 - ratio * 60;
+  }
+  if (b.type === 'dasher') return 22;
+  return 355 - Math.min((ratio - 1) * 20, 15);
+}
+
+function draw() {
+  const s = camS;
+  const now = performance.now();
+  g.save();
+  g.translate(rand(-shake, shake), rand(-shake, shake));
+
+  fillBg(stageOf(bgFrom), 1);
+  fillBg(stageOf(tier), bgT);
+
+  // parallax stars
+  for (const st of stars) {
+    st.x = (st.x - player.vx * s * st.d * 0.0004 / (W / 1000) + 1) % 1;
+    st.y = (st.y - player.vy * s * st.d * 0.0004 / (H / 1000) + 1) % 1;
+    g.fillStyle = `rgba(255,255,255,${0.15 + st.d * 0.5})`;
+    g.fillRect(st.x * W, st.y * H, st.d * 2.2, st.d * 2.2);
+  }
+
+  const toS = (wx, wy) => [W / 2 + (wx - player.x) * s, H / 2 + (wy - player.y) * s];
+
+  if (power && power.kind === 'MAGNET' && mode === 'play') {
+    g.strokeStyle = 'rgba(120,200,255,0.25)'; g.lineWidth = 2;
+    for (let k = 0; k < 3; k++) {
+      const rr = ((now / 6 + k * 60) % 180) + player.r * s;
+      g.beginPath(); g.arc(W / 2, H / 2, rr, 0, 7); g.stroke();
+    }
+  }
+
+  for (const b of blobs) {
+    let [sx, sy] = toS(b.x, b.y);
+    const r = b.r * s;
+    if (sx < -r * 2 || sy < -r * 2 || sx > W + r * 2 || sy > H + r * 2) continue;
+    const ratio = b.r / player.r;
+    const hue = blobColor(b, ratio);
+    const danger = !b.edible;
+    if (b.st === 'charge' && danger) { sx += rand(-3, 3); sy += rand(-3, 3); }
+    const light = b.st === 'charge' && danger ? 70 : b.type === 'gold' ? 55 + 10 * Math.sin(now / 80) : 58;
+    g.fillStyle = `hsl(${hue},85%,${light}%)`;
+    g.shadowColor = `hsl(${hue},90%,60%)`;
+    g.shadowBlur = danger || b.type === 'gold' ? 25 : 12;
+    if (b.type === 'spike') spikePath(sx, sy, r, b.ph); else blobPath(sx, sy, r, b.ph);
+    g.fill();
+    g.shadowBlur = 0;
+    if (b.type === 'spike') continue;
+    if (danger || b.eyes || b.type === 'gold') drawEyes(sx, sy, r, W / 2 - sx, H / 2 - sy, danger);
+  }
+
+  for (const p of parts) {
+    const [sx, sy] = toS(p.x, p.y);
+    g.globalAlpha = Math.max(p.life, 0);
+    g.fillStyle = `hsl(${p.hue},90%,65%)`;
+    g.beginPath(); g.arc(sx, sy, p.r * s, 0, 7); g.fill();
+  }
+  g.globalAlpha = 1;
+
+  // player
+  const flicker = invuln > 0 && Math.floor(now / 70) % 2;
+  if (mode !== 'dead' && !flicker) {
+    const r = player.r * s;
+    const squish = 1 + Math.min(Math.hypot(player.vx, player.vy) * s / 2000, 0.25);
+    const ang = Math.atan2(player.vy, player.vx);
+    g.save();
+    g.translate(W / 2, H / 2);
+    // dash readiness ring
+    if (mode === 'play') {
+      const ready = dashCd <= 0;
+      g.strokeStyle = ready ? 'rgba(255,209,102,0.5)' : 'rgba(255,255,255,0.15)';
+      g.lineWidth = 3;
+      g.beginPath();
+      g.arc(0, 0, r * 1.25 + 4, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (ready ? 1 : 1 - dashCd / 1.4));
+      g.stroke();
+    }
+    g.rotate(ang); g.scale(squish, 1 / squish); g.rotate(-ang);
+    const pg = g.createRadialGradient(-r * 0.3, -r * 0.3, r * 0.1, 0, 0, r);
+    pg.addColorStop(0, '#fff6b0'); pg.addColorStop(1, '#ffb703');
+    g.fillStyle = pg;
+    g.shadowColor = power && power.kind === 'FRENZY' ? '#4cc9f0' : '#ffd166';
+    g.shadowBlur = power ? 50 : 30;
+    blobPath(0, 0, r, player.wob * 3);
+    g.fill();
+    g.shadowBlur = 0;
+    drawEyes(0, 0, r, mouse.x - W / 2, mouse.y - H / 2, !!power);
+    g.fillStyle = '#5a1a00';
+    g.beginPath();
+    const open = dashT > 0 ? 0.3 : 0.06 + Math.min(combo, 8) * 0.03;
+    g.ellipse(0, r * 0.35, r * 0.25, r * open, 0, 0, Math.PI * 2);
+    g.fill();
+    g.restore();
+  }
+
+  // edge warnings for threats you can't see yet
+  if (mode === 'play') {
+    for (const b of blobs) {
+      if (b.edible || b.type === 'spike') continue;
+      const [sx, sy] = toS(b.x, b.y);
+      const r = b.r * s;
+      if (sx > -r && sy > -r && sx < W + r && sy < H + r) continue;
+      const d = Math.hypot(b.x - player.x, b.y - player.y);
+      if (d > viewR() * 1.1) continue;
+      const a = Math.atan2(sy - H / 2, sx - W / 2);
+      const ex = Math.min(Math.max(W / 2 + Math.cos(a) * W, 18), W - 18);
+      const ey = Math.min(Math.max(H / 2 + Math.sin(a) * H, 18), H - 18);
+      g.save();
+      g.translate(ex, ey); g.rotate(a);
+      g.fillStyle = b.type === 'dasher' ? '#ff8c42' : '#ff3355';
+      g.globalAlpha = 0.5 + 0.5 * Math.sin(now / 100);
+      g.beginPath(); g.moveTo(12, 0); g.lineTo(-8, -9); g.lineTo(-8, 9); g.fill();
+      g.restore();
+    }
+  }
+
+  g.textAlign = 'center';
+  for (const t of texts) {
+    const [sx, sy] = toS(t.x, t.y);
+    g.font = `bold ${t.big ? 34 : 20}px system-ui, sans-serif`;
+    g.globalAlpha = Math.min(t.life * 2, 1);
+    g.fillStyle = t.big ? '#ffd166' : '#fff';
+    g.fillText(t.t, sx, sy - (1 - t.life) * 60);
+  }
+  g.globalAlpha = 1;
+  g.restore();
+
+  if (flash > 0.01) {
+    g.fillStyle = `rgba(255,255,255,${flash * 0.6})`;
+    g.fillRect(0, 0, W, H);
+  }
+
+  // HUD
+  g.textAlign = 'left';
+  if (mode === 'play') {
+    g.fillStyle = 'rgba(255,255,255,0.9)';
+    g.font = 'bold 24px system-ui, sans-serif';
+    g.fillText(score.toLocaleString(), 20, 38);
+    g.font = '15px system-ui, sans-serif';
+    g.fillStyle = 'rgba(255,255,255,0.55)';
+    g.fillText(`${stageName(tier)} · size ${Math.round(player.r)} · best ${best.toLocaleString()}`, 20, 60);
+    // progress to next stage
+    const tr = tierR(tier);
+    const prog = Math.max(0, Math.min((player.r - tr * 0.7) / (tr * TIER_GROW - tr * 0.7), 1));
+    g.fillStyle = 'rgba(255,255,255,0.12)'; g.fillRect(20, 70, 160, 6);
+    g.fillStyle = '#ffd166'; g.fillRect(20, 70, 160 * prog, 6);
+    if (combo > 1) {
+      g.textAlign = 'right';
+      g.font = `bold ${24 + Math.min(combo, 20) * 2}px system-ui, sans-serif`;
+      g.fillStyle = `hsl(${(combo * 25) % 360},90%,65%)`;
+      g.fillText(`COMBO x${combo}`, W - 20, 40 + Math.min(combo, 20));
+    }
+    if (power) {
+      g.textAlign = 'center';
+      g.font = 'bold 18px system-ui, sans-serif';
+      g.fillStyle = power.kind === 'FRENZY' ? '#4cc9f0' : '#9bf6ff';
+      g.fillText(power.kind === 'FRENZY' ? 'FRENZY — eat EVERYTHING' : 'MAGNET', W / 2, 34);
+      g.fillRect(W / 2 - 80, 42, 160 * (power.t / 6), 5);
+    }
+  }
+
+  g.textAlign = 'center';
+  if (banner) {
+    const a = Math.min(banner.t, 1);
+    g.globalAlpha = a;
+    big(banner.text, H * 0.28, 64);
+    small(banner.sub, H * 0.28 + 36, 0.9);
+    g.globalAlpha = 1;
+  }
+  if (mode === 'title') {
+    big('NOM', H / 2 - 70, 110);
+    small('steer with mouse · click / space to DASH', H / 2);
+    small('eat teal · flee red · never touch purple spikes', H / 2 + 28);
+    small('gold = powers · stop eating and you shrink', H / 2 + 56);
+    small('click / tap to start', H / 2 + 100, 0.5 + 0.5 * Math.sin(now / 300));
+    if (best) small(`best ${best.toLocaleString()}`, H / 2 + 136, 0.6);
+  } else if (mode === 'dead') {
+    big('NOMMED', H / 2 - 50, 90);
+    small(`you ${deathMsg} in the ${stageName(tier)}`, H / 2 + 10);
+    small(`score ${score.toLocaleString()}  ·  best ${best.toLocaleString()}`, H / 2 + 40);
+    if (deadTimer > 0.8) small('click / tap to go again', H / 2 + 80, 0.5 + 0.5 * Math.sin(now / 300));
+  }
+}
+
+function big(t, y, size) {
+  g.font = `900 ${size}px system-ui, sans-serif`;
+  g.fillStyle = '#ffd166';
+  g.shadowColor = '#ff006e'; g.shadowBlur = 30;
+  g.fillText(t, W / 2, y);
+  g.shadowBlur = 0;
+}
+function small(t, y, a = 0.85) {
+  g.font = '18px system-ui, sans-serif';
+  g.fillStyle = `rgba(255,255,255,${a})`;
+  g.fillText(t, W / 2, y);
+}
+
+// ---------- loop ----------
+reset();
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
