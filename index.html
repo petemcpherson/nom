@@ -454,6 +454,12 @@ function update(dt) {
     const bs = Math.hypot(b.vx, b.vy);
     if (bs > max) { b.vx *= max / bs; b.vy *= max / bs; }
     b.x += b.vx * dt; b.y += b.vy * dt;
+    // blobs can overlap each other, but never the boss — keep its body clear for ramming
+    if (boss) {
+      const ox = b.x - boss.x, oy = b.y - boss.y;
+      const od = Math.hypot(ox, oy) || 1, min = boss.r + b.r;
+      if (od < min) { b.x = boss.x + (ox / od) * min; b.y = boss.y + (oy / od) * min; }
+    }
 
     if (d > vr * 2.2) { blobs.splice(i, 1); continue; }
 
