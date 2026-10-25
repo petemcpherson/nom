@@ -32,7 +32,11 @@ addEventListener('pointermove', setPointer);
 addEventListener('pointerdown', e => { setPointer(e); onTap(); });
 addEventListener('keydown', e => {
   if (mode === 'pick') { if (/^Digit[1-3]$/.test(e.code)) choose(+e.code[5] - 1); }
-  else if (e.code === 'KeyP' || e.code === 'Escape') { if (mode === 'play') paused = !paused; }
+  else if (mode === 'title' && /^Digit[1-2]$/.test(e.code)) start(STYLES[+e.code[5] - 1]);
+  else if (e.code === 'KeyP' || e.code === 'Escape') {
+    if (mode === 'play') paused = !paused;
+    else if (mode === 'dead' && deadTimer > 0.8) mode = 'title';
+  }
   else if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); onTap(); }
 });
 
@@ -75,8 +79,16 @@ const targetScale = () => Math.min(W, H) * 0.03 / tierR(tier);
 
 // ---------- state ----------
 const rand = (a, b) => a + Math.random() * (b - a);
-let best = 0;
-try { best = +localStorage.getItem('nom-best2') || 0; } catch (_) {}
+// play styles: chosen on the title screen, fixed for the run. `lives` = spare lives at start
+const STYLES = [
+  { id: 'beginner', name: 'BEGINNER', lives: 3, desc: '3 lives', key: 'nom-best2-beginner' },
+  { id: 'hardcore', name: 'HARDCORE', lives: 0, desc: 'one life. no mercy.', key: 'nom-best2' },
+];
+const bests = {};
+for (const st of STYLES) { bests[st.id] = 0; try { bests[st.id] = +localStorage.getItem(st.key) || 0; } catch (_) {} }
+let style = STYLES[0];
+try { style = STYLES.find(st => st.id === localStorage.getItem('nom-style')) || style; } catch (_) {}
+let best = bests[style.id];
 
 // ---------- upgrades & bosses ----------
 // each pick is a small nudge; picks stack with no cap, so a run builds toward
@@ -137,7 +149,7 @@ function reset() {
   dashT = 0; dashCd = 0; knockT = 0; power = null; banner = null; flash = 0;
   bgFrom = 0; bgT = 1;
   boss = null; cleared = false; clearT = 0; shots = []; choices = null; pickTimer = 0;
-  up = { ...BASE_UP };
+  up = { ...BASE_UP, lives: style.lives };
   taken = {}; dashCharges = up.charges;
   camS = targetScale();
   for (let i = 0; i < 45; i++) spawn(true);
@@ -166,8 +178,12 @@ function spawn(anywhere) {
 
 function onTap() {
   if (paused) { paused = false; return; }
-  if (mode === 'title' || (mode === 'dead' && deadTimer > 0.8)) {
-    reset(); mode = 'play'; blip(440, 0.12, 'triangle');
+  if (mode === 'title') {
+    // tapping a style card picks it; tapping elsewhere (or space) reuses the highlighted one
+    const i = styleRects().findIndex(r => inRect(mouse, r));
+    start(i >= 0 ? STYLES[i] : style);
+  } else if (mode === 'dead' && deadTimer > 0.8) {
+    start(style);
   } else if (mode === 'pick') {
     const i = cardRects().findIndex(r => inRect(mouse, r));
     if (i >= 0) choose(i);
@@ -180,6 +196,18 @@ function onTap() {
     dashCharges--; dashT = 0.25;
     blip(180, 0.18, 'square', 0.06, 3);
   }
+}
+
+function start(st) {
+  style = st; best = bests[st.id];
+  try { localStorage.setItem('nom-style', st.id); } catch (_) {}
+  reset(); mode = 'play'; blip(440, 0.12, 'triangle');
+}
+
+// title-screen style cards; shared by drawing and hit-testing like cardRects()
+function styleRects() {
+  const w = Math.min(200, (W - 48) / 2), h = 84, gap = 16, y = H / 2 + 24;
+  return STYLES.map((_, i) => ({ x: W / 2 - w - gap / 2 + i * (w + gap), y, w, h }));
 }
 
 function startPick() {
@@ -522,8 +550,16 @@ function die(msg) {
   if (mode !== 'play') return;
   if (up.lives > 0) {
     up.lives--;
-    invuln = 2.5; player.r = Math.max(player.r * 0.7, 7);
-    banner = { text: 'SECOND LIFE', sub: 'used it. careful now.', t: 2 };
+    invuln = 2.5; player.r = Math.max(player.r * 0.7, 7); combo = 0;
+    // shockwave: scatter whatever was about to eat us so the respawn isn't an instant re-death
+    for (let i = blobs.length - 1; i >= 0; i--) {
+      const b = blobs[i];
+      if (!b.edible && Math.hypot(b.x - player.x, b.y - player.y) < player.r * 5 + b.r) {
+        burst(b.x, b.y, b.r, 290, 10); blobs.splice(i, 1);
+      }
+    }
+    burst(player.x, player.y, player.r, 50, 40);
+    banner = { text: 'LIFE LOST', sub: `you ${msg} · ${up.lives ? `${up.lives} li${up.lives === 1 ? 'fe' : 'ves'} left` : 'last life. careful now.'}`, t: 2.2 };
     flash = 1; shake = 20;
     arp([784, 659, 523], 80);
     return;
@@ -531,7 +567,7 @@ function die(msg) {
   mode = 'dead'; deadTimer = 0; deathMsg = msg; power = null;
   burst(player.x, player.y, player.r, 50, 80);
   shake = 30; boom();
-  if (score > best) { best = score; try { localStorage.setItem('nom-best2', best); } catch (_) {} }
+  if (score > best) { best = bests[style.id] = score; try { localStorage.setItem(style.key, best); } catch (_) {} }
 }
 
 function burst(x, y, r, hue, n) {
@@ -760,6 +796,10 @@ function draw() {
     const prog = Math.max(0, Math.min((player.r - tr * 0.7) / (tr * TIER_GROW - tr * 0.7), 1));
     g.fillStyle = 'rgba(255,255,255,0.12)'; g.fillRect(20, 70, 160, 6);
     g.fillStyle = '#ffd166'; g.fillRect(20, 70, 160 * prog, 6);
+    // spare lives: one little blob each
+    g.fillStyle = '#ffd166';
+    for (let i = 0; i < Math.min(up.lives, 10); i++) { g.beginPath(); g.arc(27 + i * 18, 92, 6, 0, Math.PI * 2); g.fill(); }
+    if (up.lives > 10) { g.font = '13px system-ui, sans-serif'; g.fillText(`+${up.lives - 10}`, 200, 97); }
     if (combo > 1) {
       g.textAlign = 'right';
       g.font = `bold ${24 + Math.min(combo, 20) * 2}px system-ui, sans-serif`;
@@ -794,18 +834,21 @@ function draw() {
     g.globalAlpha = 1;
   }
   if (mode === 'title') {
-    big('NOM', H / 2 - 70, 110);
-    small('steer with mouse · click / space to DASH', H / 2);
-    small('eat teal · flee red · never touch purple spikes', H / 2 + 28);
-    small('gold = powers · stop eating and you shrink', H / 2 + 56);
-    small('level up to pick upgrades · DASH into bosses · P to pause', H / 2 + 84);
-    small('click / tap to start', H / 2 + 128, 0.5 + 0.5 * Math.sin(now / 300));
-    if (best) small(`best ${best.toLocaleString()}`, H / 2 + 164, 0.6);
+    big('NOM', H / 2 - 150, 110);
+    small('steer with mouse · click / space to DASH', H / 2 - 92);
+    small('eat teal · flee red · never touch purple spikes', H / 2 - 64);
+    small('gold = powers · stop eating and you shrink', H / 2 - 36);
+    small('level up to pick upgrades · DASH into bosses · P to pause', H / 2 - 8);
+    drawStyles();
+    small('pick a play style to start (click or 1 / 2)', H / 2 + 140, 0.5 + 0.5 * Math.sin(now / 300));
   } else if (mode === 'dead') {
     big('NOMMED', H / 2 - 50, 90);
     small(`you ${deathMsg} in the ${stageName(tier)}`, H / 2 + 10);
-    small(`score ${score.toLocaleString()}  ·  best ${best.toLocaleString()}`, H / 2 + 40);
-    if (deadTimer > 0.8) small('click / tap to go again', H / 2 + 80, 0.5 + 0.5 * Math.sin(now / 300));
+    small(`${style.name.toLowerCase()} · score ${score.toLocaleString()}  ·  best ${best.toLocaleString()}`, H / 2 + 40);
+    if (deadTimer > 0.8) {
+      small('click / tap to go again', H / 2 + 80, 0.5 + 0.5 * Math.sin(now / 300));
+      small('esc to change play style', H / 2 + 106, 0.5);
+    }
   } else if (mode === 'pick') {
     drawPick();
   } else if (paused) {
@@ -814,6 +857,27 @@ function draw() {
     big('PAUSED', H / 2 - 20, 80);
     small('press P or click to resume', H / 2 + 30, 0.5 + 0.5 * Math.sin(now / 300));
   }
+}
+
+function drawStyles() {
+  styleRects().forEach((r, i) => {
+    const st = STYLES[i], on = st === style, hover = inRect(mouse, r);
+    g.fillStyle = hover ? 'rgba(255,209,102,0.18)' : on ? 'rgba(255,209,102,0.1)' : 'rgba(255,255,255,0.07)';
+    g.strokeStyle = hover || on ? '#ffd166' : 'rgba(255,255,255,0.25)';
+    g.lineWidth = 2;
+    g.beginPath(); g.roundRect(r.x, r.y, r.w, r.h, 14); g.fill(); g.stroke();
+    const cx = r.x + r.w / 2;
+    g.textAlign = 'center';
+    g.fillStyle = '#ffd166';
+    g.font = 'bold 20px system-ui, sans-serif';
+    g.fillText(`${i + 1} · ${st.name}`, cx, r.y + 30);
+    g.fillStyle = 'rgba(255,255,255,0.8)';
+    g.font = '14px system-ui, sans-serif';
+    g.fillText(st.desc, cx, r.y + 52);
+    g.fillStyle = 'rgba(255,255,255,0.45)';
+    g.font = '13px system-ui, sans-serif';
+    g.fillText(bests[st.id] ? `best ${bests[st.id].toLocaleString()}` : 'no best yet', cx, r.y + 72);
+  });
 }
 
 function drawPick() {

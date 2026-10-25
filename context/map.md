@@ -11,7 +11,7 @@ NOM is a single-file browser arcade game (agar.io-like). You steer a yellow blob
 
 - Plain HTML + vanilla JavaScript + Canvas 2D. No framework, no build step, no dependencies, no package.json.
 - Audio: Web Audio API oscillators (procedural blips, no audio files).
-- Persistence: `localStorage` key `nom-best2` (best score only).
+- Persistence: `localStorage` keys `nom-best2` (hardcore best), `nom-best2-beginner` (beginner best), `nom-style` (last chosen play style).
 - Run: open `index.html` in a browser (or serve the folder with any static server).
 - No tests, no linting config.
 
@@ -32,13 +32,13 @@ The script is organized by `// ---------- section ----------` comment headers, i
 | input | 28–36 | `mouse` {x,y} in screen coords; pointer + keyboard → `onTap()` / `choose()` |
 | audio | 38–54 | `blip()`, `arp()` (note sequence), `boom()` (death sound) |
 | stages | 56–73 | `STAGES` array, `stageOf`, `stageName`, `TIER_GROW`, `tierR`, `targetScale` |
-| state | 75–78 | `rand()`, `best` loaded from localStorage |
+| state | 75–88 | `rand()`, `STYLES` (play styles), `bests` per style, `style`, `best` (current style's best) |
 | upgrades & bosses (data) | 80–100 | `UPGRADES` and `BOSSES` definition tables |
 | globals + `reset()` | 102–123 | all mutable game state; `reset()` initializes a run |
-| spawning / input actions | 125–190 | `viewR`, `spawn`, `onTap` (start/dash/pick), `startPick`, `choose`, `cardRects`, `inRect` |
+| spawning / input actions | 135–215 | `viewR`, `spawn`, `onTap` (start/dash/pick), `start(style)`, `styleRects`, `startPick`, `choose`, `cardRects`, `inRect` |
 | bosses (logic) | 192–324 | `spawnBoss`, `updateBoss`, `hitBoss`, `chunk`, `killBoss`, `updateShots` |
 | update | 326–503 | `update(dt)` main sim, `eat`, `hurt`, `die`, `burst` |
-| draw | 505–870 | `draw()` plus helpers: `blobPath`, `spikePath`, `drawEyes`, `fillBg`, `blobColor`, `drawPick`, `wrap`, `edgeArrow`, `drawBoss`, `big`, `small` |
+| draw | 505–870 | `draw()` plus helpers: `blobPath`, `spikePath`, `drawEyes`, `fillBg`, `blobColor`, `drawStyles`, `drawPick`, `wrap`, `edgeArrow`, `drawBoss`, `big`, `small` |
 | loop | 872–882 | `frame()` via `requestAnimationFrame`; `dt` clamped to 0.05s |
 
 ## Core concepts
@@ -47,16 +47,26 @@ The script is organized by `// ---------- section ----------` comment headers, i
 
 `mode` is a global string: `'title' | 'play' | 'pick' | 'dead'`.
 
-- `title` → tap → `reset()` + `play`
+- `title` → tap a style card (or 1 / 2; Space/tap elsewhere reuses the highlighted style) → `start(style)` → `reset()` + `play`
 - `play` → growing past the end of the newest stage → player is held at the threshold and `spawnBoss()` runs
 - `killBoss()` → sets `cleared`, and after `clearT` (1.8s) bumps `player.r` over the threshold → tier up → `startPick()` → `pick`
 - `pick` → `choose(i)` → `play`
-- `play` → `die()` → `dead` (unless `up.lives > 0`, which consumes a spare life instead)
-- `dead` → tap after 0.8s → `reset()` + `play`
+- `play` → `die()` → `dead` (unless `up.lives > 0`, which consumes a spare life instead; see Lives)
+- `dead` → tap after 0.8s → `start(style)` (same style). Escape after 0.8s → `title` to change style.
 
 While in `pick`, `update()` only advances `pickTimer` (the world is frozen). Picks are ignored for the first 0.5s to prevent accidental clicks.
 
 Pause is a separate `paused` flag, not a mode. P or Escape toggles it during `play`. Any tap resumes without dashing. While `paused` is set, `update()` returns at once and `draw()` shows a PAUSED overlay. `reset()` clears the flag.
+
+### Play styles & lives
+
+- `STYLES` = `{ id, name, lives, desc, key }`: `beginner` (3 starting lives) and `hardcore` (0, the original one-hit run). `key` is that style's best-score localStorage key.
+- `style` is the chosen entry; fixed for a run. Chosen on the title screen via cards from `styleRects()` (shared by `drawStyles()` and hit-testing in `onTap`, like `cardRects`). Persisted in `nom-style`.
+- `reset()` seeds `up.lives = style.lives`. `up.lives` counts *spare* lives: the run ends on a fatal hit at 0.
+- `die(msg)` with `up.lives > 0`: decrement, 2.5s `invuln`, shrink to `max(r*0.7, 7)`, reset combo, remove non-edible blobs within `5*player.r` (shockwave so the respawn isn't an instant re-death), "LIFE LOST" banner with lives left. Bosses and spikes only `hurt()`, never `die()`.
+- Gaining lives: currently only the Nine Lives upgrade (`lifeBits`, every 4th shard → `up.lives++`), available in both styles. Future life sources should just `up.lives++`.
+- HUD draws one yellow dot per spare life under the progress bar (max 10 dots, then `+N`).
+- `best` mirrors `bests[style.id]`; `die()` saves to `style.key`. Hardcore keeps the legacy `nom-best2` key.
 
 ### World & camera
 
@@ -165,4 +175,6 @@ Draw order: screen shake translate → bg gradients → parallax stars → magne
 - **New blob type**: branch in `spawn`, AI branch in the `update` blob loop, collision branch, and colour in `blobColor`.
 - **New boss**: entry in `BOSSES`, plus a `kind` branch in `updateBoss` (and optionally `drawBoss`).
 - **New power**: set `power.kind` in `eat()`, read it in `update`/`draw`, and add a HUD label in `draw`.
-- **Reset best score**: change the `nom-best2` key, or clear localStorage.
+- **New play style**: add a `STYLES` entry (unique `id` and best `key`); `styleRects` lays out cards side by side, so more than ~3 needs a layout change. Number keys on the title screen are matched by `/^Digit[1-2]$/` in the keydown handler.
+- **New life source**: `up.lives++` (and a banner/text); HUD and `die()` already handle any count.
+- **Reset best score**: change the style's `key` (`nom-best2` / `nom-best2-beginner`), or clear localStorage.
